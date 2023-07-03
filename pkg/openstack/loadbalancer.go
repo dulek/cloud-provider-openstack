@@ -37,6 +37,7 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/security/rules"
 	neutronports "github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
 	"github.com/gophercloud/gophercloud/openstack/networking/v2/subnets"
+	"github.com/gophercloud/gophercloud/pagination"
 	secgroups "github.com/gophercloud/utils/openstack/networking/v2/extensions/security/groups"
 	"gopkg.in/godo.v2/glob"
 	corev1 "k8s.io/api/core/v1"
@@ -420,6 +421,28 @@ func getSecurityGroupName(service *corev1.Service) string {
 	}
 
 	return securityGroupName
+}
+
+func getSecurityGroupRules(client *gophercloud.ServiceClient, opts rules.ListOpts) ([]rules.SecGroupRule, error) {
+	var securityRules []rules.SecGroupRule
+
+	mc := metrics.NewMetricContext("security_group_rule", "list")
+	pager := rules.List(client, opts)
+
+	err := pager.EachPage(func(page pagination.Page) (bool, error) {
+		ruleList, err := rules.ExtractRules(page)
+		if err != nil {
+			return false, err
+		}
+		securityRules = append(securityRules, ruleList...)
+		return true, nil
+	})
+
+	if mc.ObserveRequest(err) != nil {
+		return nil, err
+	}
+
+	return securityRules, nil
 }
 
 func getListenerProtocol(protocol corev1.Protocol, svcConf *serviceConfig) listeners.Protocol {
@@ -2060,30 +2083,14 @@ func (lbaas *LbaasV2) listSubnetsForNetwork(networkID string, tweak ...TweakSubN
 }
 
 // group, if it not present.
-func (lbaas *LbaasV2) ensureSecurityRule(
-	direction rules.RuleDirection,
-	protocol rules.RuleProtocol,
-	etherType rules.RuleEtherType,
-	remoteIPPrefix, secGroupID string,
-	portRangeMin, portRangeMax int,
-) error {
-	sgRuleCreateOpts := rules.CreateOpts{
-		Direction:      direction,
-		Protocol:       protocol,
-		PortRangeMax:   portRangeMin,
-		PortRangeMin:   portRangeMax,
-		RemoteIPPrefix: remoteIPPrefix,
-		SecGroupID:     secGroupID,
-		EtherType:      etherType,
-	}
-
+func (lbaas *LbaasV2) ensureSecurityRule(sgRuleCreateOpts rules.CreateOpts) error {
 	mc := metrics.NewMetricContext("security_group_rule", "create")
 	_, err := rules.Create(lbaas.network, sgRuleCreateOpts).Extract()
 	if err != nil && cpoerrors.IsConflictError(err) {
 		// Conflict means the SG rule already exists, so ignoring that error.
 		return mc.ObserveRequest(nil)
 	} else if mc.ObserveRequest(err) != nil {
-		return fmt.Errorf("failed to create rule for security group %s: %v", secGroupID, err)
+		return fmt.Errorf("failed to create rule for security group %s: %v", sgRuleCreateOpts.SecGroupID, err)
 	}
 	return nil
 }
@@ -2174,6 +2181,15 @@ func (lbaas *LbaasV2) UpdateLoadBalancer(ctx context.Context, clusterName string
 	return mc.ObserveReconcile(err)
 }
 
+func compareSecurityGroupRuleAndCreateOpts(rule rules.SecGroupRule, opts rules.CreateOpts) bool {
+	return rule.Direction == string(opts.Direction) &&
+		rule.Protocol == string(opts.Protocol) &&
+		rule.EtherType == string(opts.EtherType) &&
+		rule.RemoteIPPrefix == opts.RemoteIPPrefix &&
+		rule.PortRangeMin == opts.PortRangeMin &&
+		rule.PortRangeMax == opts.PortRangeMax
+}
+
 // ensureAndUpdateOctaviaSecurityGroup handles the creation and update of the security group and the securiry rules for the octavia load balancer
 func (lbaas *LbaasV2) ensureAndUpdateOctaviaSecurityGroup(clusterName string, apiService *corev1.Service, nodes []*corev1.Node, memberSubnetID string) error {
 	// get service ports
@@ -2220,41 +2236,92 @@ func (lbaas *LbaasV2) ensureAndUpdateOctaviaSecurityGroup(clusterName string, ap
 		etherType = rules.EtherType6
 	}
 
-	if apiService.Spec.HealthCheckNodePort != 0 {
-		err = lbaas.ensureSecurityRule(
-			rules.DirIngress,
-			rules.ProtocolTCP,
-			etherType,
-			subnet.CIDR,
-			lbSecGroupID,
-			int(apiService.Spec.HealthCheckNodePort),
-			int(apiService.Spec.HealthCheckNodePort),
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"failed to apply security rule for health check node port, %w",
-				err)
-		}
+	existingRules, err := getSecurityGroupRules(lbaas.network, rules.ListOpts{SecGroupID: lbSecGroupID})
+	if err != nil && !cpoerrors.IsNotFound(err) {
+		return fmt.Errorf(
+			"failed to find security group rules in %s: %v", lbSecGroupID, err)
 	}
 
-	// ensure rules for node security group
+	// List of the security group rules wanted in the SG.
+	// Number of Ports plus the potential HealthCheckNodePort.
+	wantedRules := make([]rules.CreateOpts, 0, len(ports)+1)
+
+	if apiService.Spec.HealthCheckNodePort != 0 {
+		wantedRules = append(wantedRules,
+			rules.CreateOpts{
+				Direction:      rules.DirIngress,
+				Protocol:       rules.ProtocolTCP,
+				EtherType:      etherType,
+				RemoteIPPrefix: subnet.CIDR,
+				SecGroupID:     lbSecGroupID,
+				PortRangeMin:   int(apiService.Spec.HealthCheckNodePort),
+				PortRangeMax:   int(apiService.Spec.HealthCheckNodePort),
+			},
+		)
+	}
+
 	for _, port := range ports {
 		if port.NodePort == 0 { // It's 0 when AllocateLoadBalancerNodePorts=False
 			continue
 		}
-		err = lbaas.ensureSecurityRule(
-			rules.DirIngress,
-			rules.RuleProtocol(port.Protocol),
-			etherType,
-			subnet.CIDR,
-			lbSecGroupID,
-			int(port.NodePort),
-			int(port.NodePort),
+		wantedRules = append(wantedRules,
+			rules.CreateOpts{
+				Direction:      rules.DirIngress,
+				Protocol:       rules.ProtocolTCP,
+				EtherType:      etherType,
+				RemoteIPPrefix: subnet.CIDR,
+				SecGroupID:     lbSecGroupID,
+				PortRangeMin:   int(port.NodePort),
+				PortRangeMax:   int(port.NodePort),
+			},
 		)
+	}
+
+	toCreate := make([]rules.CreateOpts, 0, len(ports)+1)         // Max is number of ports+1
+	toDelete := make([]rules.SecGroupRule, 0, len(existingRules)) // Max will be all the existing rules
+	// Surely this can be done in a more efficient way. Is it worth optimizing if most of
+	// the time we'll deal with just 1 or 2 elements in each array? I doubt it.
+	for _, rule := range existingRules {
+		found := false
+		for _, opts := range wantedRules {
+			if compareSecurityGroupRuleAndCreateOpts(rule, opts) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// in existingRules but not in wantedRules, delete
+			toDelete = append(toDelete, rule)
+		}
+	}
+	for _, opts := range wantedRules {
+		found := false
+		for _, rule := range existingRules {
+			if compareSecurityGroupRuleAndCreateOpts(rule, opts) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// in wantedRules but not in exisitngRules, create
+			toCreate = append(toCreate, opts)
+		}
+	}
+
+	// create new rules
+	for _, opts := range toCreate {
+		err := lbaas.ensureSecurityRule(opts)
 		if err != nil {
-			return fmt.Errorf(
-				"failed to apply security rule for port %d, %w",
-				port.NodePort, err)
+			return fmt.Errorf("failed to apply security rule (%v), %w", opts, err)
+		}
+	}
+
+	// delete unneeded rules
+	for _, existingRule := range toDelete {
+		klog.Infof("Deleting rule %s from security group %s (%s)", existingRule.ID, existingRule.SecGroupID, lbSecGroupName)
+		err := rules.Delete(lbaas.network, existingRule.ID).ExtractErr()
+		if err != nil && !cpoerrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete security group rule %s: %w", existingRule.ID, err)
 		}
 	}
 
